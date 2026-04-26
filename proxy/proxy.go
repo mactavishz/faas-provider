@@ -51,6 +51,13 @@ type BaseURLResolver interface {
 	Resolve(functionName string) (url.URL, error)
 }
 
+// InvocationLifecycle allows providers to track invocation begin/end around
+// the proxy request lifecycle.
+type InvocationLifecycle interface {
+	StartInvocation(r *http.Request, functionName string) error
+	EndInvocation(r *http.Request, functionName string)
+}
+
 // NewHandlerFunc creates a standard http.HandlerFunc to proxy function requests.
 // When verbose is set to true, the timing of each invocation will be printed out to
 // stderr.
@@ -64,6 +71,12 @@ type BaseURLResolver interface {
 //
 // Note that this will panic if `resolver` is nil.
 func NewHandlerFunc(config types.FaaSConfig, resolver BaseURLResolver, verbose bool) http.HandlerFunc {
+	return NewHandlerFuncWithLifecycle(config, resolver, verbose, nil)
+}
+
+// NewHandlerFuncWithLifecycle creates a standard http.HandlerFunc to proxy
+// function requests with an optional invocation lifecycle hook.
+func NewHandlerFuncWithLifecycle(config types.FaaSConfig, resolver BaseURLResolver, verbose bool, lifecycle InvocationLifecycle) http.HandlerFunc {
 	if resolver == nil {
 		panic("NewHandlerFunc: empty proxy handler resolver, cannot be nil")
 	}
@@ -94,7 +107,7 @@ func NewHandlerFunc(config types.FaaSConfig, resolver BaseURLResolver, verbose b
 			http.MethodGet,
 			http.MethodOptions,
 			http.MethodHead:
-			proxyRequest(w, r, proxyClient, resolver, &reverseProxy, verbose)
+			proxyRequest(w, r, proxyClient, resolver, &reverseProxy, verbose, lifecycle)
 
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -145,7 +158,7 @@ func NewProxyClient(timeout time.Duration, maxIdleConns int, maxIdleConnsPerHost
 }
 
 // proxyRequest handles the actual resolution of and then request to the function service.
-func proxyRequest(w http.ResponseWriter, originalReq *http.Request, proxyClient *http.Client, resolver BaseURLResolver, reverseProxy *httputil.ReverseProxy, verbose bool) {
+func proxyRequest(w http.ResponseWriter, originalReq *http.Request, proxyClient *http.Client, resolver BaseURLResolver, reverseProxy *httputil.ReverseProxy, verbose bool, lifecycle InvocationLifecycle) {
 	ctx := originalReq.Context()
 
 	pathVars := mux.Vars(originalReq)
@@ -155,6 +168,16 @@ func proxyRequest(w http.ResponseWriter, originalReq *http.Request, proxyClient 
 
 		fhttputil.Errorf(w, http.StatusBadRequest, "Provide function name in the request path")
 		return
+	}
+
+	if lifecycle != nil {
+		err := lifecycle.StartInvocation(originalReq, functionName)
+		if err != nil {
+			w.Header().Add(openFaaSInternalHeader, "proxy")
+			fhttputil.Errorf(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		defer lifecycle.EndInvocation(originalReq, functionName)
 	}
 
 	functionAddr, err := resolver.Resolve(functionName)

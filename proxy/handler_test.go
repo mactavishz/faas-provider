@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,33 @@ import (
 type testBaseURLResolver struct {
 	testServerBase string
 	err            error
+}
+
+type testInvocationLifecycle struct {
+	mu         sync.Mutex
+	starts     int
+	ends       int
+	startError error
+}
+
+func (t *testInvocationLifecycle) StartInvocation(_ *http.Request, _ string) error {
+	t.mu.Lock()
+	t.starts++
+	err := t.startError
+	t.mu.Unlock()
+	return err
+}
+
+func (t *testInvocationLifecycle) EndInvocation(_ *http.Request, _ string) {
+	t.mu.Lock()
+	t.ends++
+	t.mu.Unlock()
+}
+
+func (t *testInvocationLifecycle) counts() (int, int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.starts, t.ends
 }
 
 func (tr *testBaseURLResolver) Resolve(name string) (url.URL, error) {
@@ -210,5 +238,78 @@ func Test_ProxyHandler_Proxy_FailsMidFlight(t *testing.T) {
 
 	if v := resp.Header.Get("X-OpenFaaS-Internal"); v != "proxy" {
 		t.Errorf("expected X-OpenFaaS-Internal header to be `proxy`, got %s", v)
+	}
+}
+
+func Test_ProxyHandler_InvocationLifecycle_Success(t *testing.T) {
+	testFuncService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer testFuncService.Close()
+
+	config := types.FaaSConfig{ReadTimeout: time.Second}
+	serverURL := strings.TrimPrefix(testFuncService.URL, "http://")
+	lifecycle := &testInvocationLifecycle{}
+	proxyFunc := NewHandlerFuncWithLifecycle(config, &testBaseURLResolver{serverURL, nil}, false, lifecycle)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/foo", nil)
+	req = mux.SetURLVars(req, map[string]string{"name": "foo"})
+
+	proxyFunc(w, req)
+	if got := w.Result().StatusCode; got != http.StatusNoContent {
+		t.Fatalf("expected status %d, got %d", http.StatusNoContent, got)
+	}
+
+	starts, ends := lifecycle.counts()
+	if starts != 1 || ends != 1 {
+		t.Fatalf("expected start/end counts 1/1, got %d/%d", starts, ends)
+	}
+}
+
+func Test_ProxyHandler_InvocationLifecycle_BeginError(t *testing.T) {
+	config := types.FaaSConfig{ReadTimeout: time.Second}
+	lifecycle := &testInvocationLifecycle{startError: errors.New("busy")}
+	proxyFunc := NewHandlerFuncWithLifecycle(config, &testBaseURLResolver{"example.com", nil}, false, lifecycle)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/foo", nil)
+	req = mux.SetURLVars(req, map[string]string{"name": "foo"})
+
+	proxyFunc(w, req)
+	if got := w.Result().StatusCode; got != http.StatusServiceUnavailable {
+		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, got)
+	}
+
+	starts, ends := lifecycle.counts()
+	if starts != 1 || ends != 0 {
+		t.Fatalf("expected start/end counts 1/0, got %d/%d", starts, ends)
+	}
+}
+
+func Test_ProxyHandler_InvocationLifecycle_EndOnProxyError(t *testing.T) {
+	var svr *httptest.Server
+	testHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		svr.Close()
+	})
+	svr = httptest.NewServer(testHandler)
+
+	config := types.FaaSConfig{ReadTimeout: 100 * time.Millisecond, WriteTimeout: 100 * time.Millisecond}
+	serverURL := strings.TrimPrefix(svr.URL, "http://")
+	lifecycle := &testInvocationLifecycle{}
+	proxyFunc := NewHandlerFuncWithLifecycle(config, &testBaseURLResolver{serverURL, nil}, false, lifecycle)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/foo", nil)
+	req = mux.SetURLVars(req, map[string]string{"name": "foo"})
+
+	proxyFunc(w, req)
+	if got := w.Result().StatusCode; got != http.StatusInternalServerError {
+		t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, got)
+	}
+
+	starts, ends := lifecycle.counts()
+	if starts != 1 || ends != 1 {
+		t.Fatalf("expected start/end counts 1/1 on proxy error, got %d/%d", starts, ends)
 	}
 }
