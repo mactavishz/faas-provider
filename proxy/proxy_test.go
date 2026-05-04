@@ -295,6 +295,28 @@ func Test_buildProxyRequest_XForwardedHostHeader_WhenAlreadyPresent(t *testing.T
 	}
 }
 
+func Test_buildProxyRequest_AppendsXForwardedForWhenPresent(t *testing.T) {
+	request, err := http.NewRequest(http.MethodPost, "http://gateway/function/test", bytes.NewReader([]byte("hello")))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request.RemoteAddr = "10.0.0.2:54321"
+	request.Header.Set("X-Forwarded-For", "198.51.100.20")
+
+	funcURL, _ := testResolver("funcName")
+	upstream, err := buildProxyRequest(request, funcURL, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := upstream.Header.Get("X-Forwarded-For")
+	want := "198.51.100.20, 10.0.0.2:54321"
+	if got != want {
+		t.Fatalf("X-Forwarded-For - want: %s, got: %s", want, got)
+	}
+}
+
 func Test_proxyRequest_ContentType_Header(t *testing.T) {
 	const requestContentType = "x-www-form-urlencoded"
 	const wantContentType = "application/json"

@@ -281,15 +281,28 @@ func buildProxyRequest(originalReq *http.Request, baseURL url.URL, extraPath str
 	if len(originalReq.Host) > 0 && upstreamReq.Header.Get("X-Forwarded-Host") == "" {
 		upstreamReq.Header["X-Forwarded-Host"] = []string{originalReq.Host}
 	}
-	if upstreamReq.Header.Get("X-Forwarded-For") == "" {
-		upstreamReq.Header["X-Forwarded-For"] = []string{originalReq.RemoteAddr}
-	}
+	appendXForwardedFor(upstreamReq.Header, originalReq.RemoteAddr)
 
 	if originalReq.Body != nil {
 		upstreamReq.Body = originalReq.Body
 	}
 
 	return upstreamReq, nil
+}
+
+func appendXForwardedFor(header http.Header, remoteAddr string) {
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	if remoteAddr == "" {
+		return
+	}
+
+	current := strings.TrimSpace(header.Get("X-Forwarded-For"))
+	if current == "" {
+		header.Set("X-Forwarded-For", remoteAddr)
+		return
+	}
+
+	header.Set("X-Forwarded-For", current+", "+remoteAddr)
 }
 
 // copyHeaders clones the header values from the source into the destination.
